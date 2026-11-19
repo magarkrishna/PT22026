@@ -6,7 +6,7 @@
 **Course:** Professional Training 2 (Mid-term Assignment)  
 **Instructor:** Ahamed Zahir 
 
----
+# Food-101 Hybrid Image Classifier
 
 This repo contains an interactive Gradio app and an evaluation pipeline for food image classification. The app classifies an uploaded image or a webcam capture into one of the 101 Food-101 categories using the pre-trained [`codealchemist01/food-image-classifier-hybrid`](https://huggingface.co/codealchemist01/food-image-classifier-hybrid) model. It then shows the top three predictions along with local nutrition information.
 
@@ -16,6 +16,8 @@ The app accepts either a file upload or a webcam capture. Predictions come from 
 
 A local knowledge base in `food_info.py` provides calories per 100 g, common ingredients, and a short description for all 101 categories. If a predicted category is missing from that knowledge base, the app shows “Nutrition information not available” rather than failing. In practice, that fallback keeps the UI usable when the model predicts something outside the local data. Model download or load errors, invalid images, and unexpected model output shapes are also reported in the UI. The evaluation script produces a confusion matrix, a classification report, and JSON metrics including top-1, top-5, and per-class precision and recall.
 
+When the optional FAISS index has been built, the app also shows a gallery of the three most visually similar Food-101 reference images **from the predicted class**. Similarity uses the fusion module's global embedding and an L2 index over L2-normalised vectors, so retrieval ranks by cosine similarity. Because a flat L2 index cannot filter by metadata, `faiss_search.ClassIndex` keeps a class-to-row dictionary and lazily builds one small per-class index from the parent vectors. A pizza prediction therefore only compares against pizza images, not visually similar textures from other categories. If the predicted class has no indexed references, the gallery stays empty and the status line explains why. If the index itself is missing, the panel explains how to build it while classification keeps working.
+
 ## Project Structure
 
 ```text
@@ -24,6 +26,7 @@ food_classifier/
 ├── model_loader.py         # Model architecture, checkpoint loading, preprocessing
 ├── food_info.py            # Nutrition knowledge base (FOOD_INFO dictionary)
 ├── evaluate.py             # Food-101 evaluation and report generation
+├── faiss_search.py         # Builds and queries the FAISS similarity index
 ├── requirements.txt        # Python dependencies
 ├── .gitignore              # Excludes caches, weights, and eval_outputs/
 ├── README.md
@@ -66,6 +69,7 @@ python app.py
 ```
 
 Open the local Gradio URL printed in the terminal, usually `http://127.0.0.1:7860`. Upload an image or use the webcam panel, then press **Analyze Food**. The top-3 predictions and nutrition panel appear alongside the image.
+
 If CUDA is unavailable, or you want to force CPU inference, set `FOOD_CLASSIFIER_DEVICE=cpu` before launching:
 
 ```bash
@@ -77,6 +81,32 @@ $env:FOOD_CLASSIFIER_DEVICE="cpu"; python app.py
 ```
 
 Webcam access works on `localhost`. If you expose the app through a remote server, browsers generally require HTTPS for camera access.
+
+## Visual Similarity Search (FAISS)
+
+The similarity gallery needs a one-time index build. It embeds 500 images from the `validation` split (about a minute on GPU, longer on CPU) and writes to `eval_outputs/`:
+
+```bash
+python faiss_search.py
+```
+
+The 500 images are sampled **class-balancingly** (about five per class). This matters because Food-101 is ordered by class: a raw slice such as `validation[:500]` contains only `beignets` and `prime_rib`, which makes class-restricted similarity search useless for every other category.
+
+| File | Contents |
+| --- | --- |
+| `food_index.faiss` | `IndexFlatL2` over fusion-module embeddings |
+| `food_index_metadata.json` | Reference image paths, class labels, class counts, and index metadata |
+| `food_index_images/` | Downscaled JPEG copies shown in the gallery |
+
+Useful options:
+
+```bash
+python faiss_search.py --batch-size 8 --device cpu
+python faiss_search.py --max-images 1000
+python faiss_search.py --split "validation[:500]" --sample-mode head   # only beignets + prime_rib
+```
+
+The Gradio app loads the index lazily on the first prediction and caches it. Similarity results are restricted to the predicted class. If the index has not been built yet (or `faiss-cpu` is not installed), classification still works and the gallery panel explains what is missing. After rebuilding the index, restart the app to clear the cached index. Both the index and the query use the same model, so the embedding dimensions always match; a mismatch is reported in the UI instead of crashing the event.
 
 ## Running the Evaluation
 
@@ -96,6 +126,7 @@ python evaluate.py --full          # entire test split (slow)
 Outputs go to `eval_outputs/`:
 
 | File | Contents |
+| --- | --- |
 | `confusion_matrix.png` | 101×101 confusion matrix (seaborn heatmap) |
 | `classification_report.txt` | Per-class precision, recall, F1, support |
 | `eval_results.json` | Top-1/top-5 accuracy, per-class metrics, metadata |

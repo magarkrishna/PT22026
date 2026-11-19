@@ -1,3 +1,8 @@
+"""Evaluate the hybrid Food-101 classifier on the Food-101 test split.
+Usage::
+    python evaluate.py
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -10,8 +15,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
 
-# I have to use "Agg" because we are running this on a server/terminal without a display.
-# It saves the plots directly to files instead of trying to open a window.
 import matplotlib
 
 matplotlib.use("Agg")  # must be set before importing pyplot
@@ -158,8 +161,8 @@ def sample_indices(
         rng.shuffle(extras)
         selected.extend(extras[:remainder])
 
-    return sorted(selected[:max_images])\
-    
+    return sorted(selected[:max_images])
+
 # Inference
 def run_inference(
     model,
@@ -179,7 +182,7 @@ def run_inference(
     total = len(indices)
     processed = 0
     next_report = 100
-    # I processed images in batches to save memory and speed up CPU inference.
+
     for start in range(0, total, batch_size):
         batch_indices = indices[start : start + batch_size]
         tensors = []
@@ -202,14 +205,10 @@ def run_inference(
                 LOGGER.warning("Skipping dataset index %s: %s", dataset_index, exc)
 
         if tensors:
-            # torch.stack turns the list of image tensors into one big tensor batch
             batch = torch.stack(tensors).to(device)
-            
-            # inference_mode() tells PyTorch we are only testing, not training.
-            # This saves memory and speeds up the process.
             with torch.inference_mode():
                 output = model(batch)
-            # Handle the custom output format of our hybrid model
+
             if isinstance(output, dict):
                 logits = output.get("logits")
             elif isinstance(output, (tuple, list)):
@@ -234,10 +233,9 @@ def run_inference(
                     f"Model returned {logits.shape[1]} classes but the class "
                     f"mapping contains {num_classes}."
                 )
-            # Softmax turns the raw logits into probabilities (e.g., 0.95, 0.03, 0.02)
+
             probabilities = torch.softmax(logits.float(), dim=1)
             k = min(5, probabilities.shape[1])
-            # Get the index of the top 5 highest probabilities
             top_indices = torch.topk(probabilities, k=k, dim=1).indices.cpu().numpy()
 
             for position, dataset_label in enumerate(batch_labels):
@@ -269,10 +267,8 @@ def save_confusion_matrix(
     labels = list(range(len(class_names)))
     matrix = confusion_matrix(y_true, y_pred, labels=labels)
 
-    # We make the figure very large (34x32) because a 101x101 grid is huge.
     figure_size = (34, 32) if len(class_names) > 40 else (16, 14)
     fig, ax = plt.subplots(figsize=figure_size)
-    # Seaborn's heatmap makes it look nice
     sns.heatmap(
         matrix,
         ax=ax,
@@ -324,7 +320,6 @@ def save_classification_report(
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    # Setup command-line arguments
     parser = argparse.ArgumentParser(
         description="Evaluate the hybrid Food-101 classifier."
     )
@@ -429,7 +424,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "No images were evaluated. The dataset could not be read or all "
             "samples were skipped."
         )
-     # Calculate top-1 and top-5 accuracy
+
     top1_accuracy = float(np.mean(np.asarray(y_true) == np.asarray(y_pred)))
     top5_accuracy = float(
         np.mean(
@@ -453,7 +448,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         class_names,
         output_dir / "confusion_matrix.png",
     )
-     # Save detailed per-class metrics to JSON
+
     per_class: Dict[str, Dict[str, float | int]] = {}
     for name in class_names:
         entry = report_dict.get(name, {})

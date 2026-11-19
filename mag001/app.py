@@ -1,10 +1,8 @@
+"""Gradio application for the hybrid Food-101 image classifier.
+Run with::
+    python app.py
 """
-AI Food Analyzer - Gradio Application
-This app uses a pre-trained hybrid ResNet50 + DeiT-Base model to classify images
-into one of 101 Food-101 categories and displays nutrition information.
-Run with:
-       python app.py
-"""
+
 from __future__ import annotations
 
 import html
@@ -20,6 +18,14 @@ from PIL import Image, ImageOps
 from food_info import FOOD_INFO
 from model_loader import load_model
 
+try:
+    import faiss_search
+except Exception as exc:  # noqa: BLE001 - keep the app usable without FAISS
+    faiss_search = None  # type: ignore[assignment]
+    _FAISS_IMPORT_ERROR: str | None = str(exc)
+else:
+    _FAISS_IMPORT_ERROR = None
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -34,6 +40,14 @@ _IDX_TO_LABEL: Dict[int, str] | None = None
 _LOAD_ERROR: str | None = None
 _LOAD_LOCK = threading.Lock()
 
+# The FAISS index is loaded lazily and cached after the first search.  It is
+# optional: when it is missing the app still classifies images normally.
+_FAISS_INDEX: Any = None
+_FAISS_IMAGES: List[Dict[str, Any]] | None = None
+_FAISS_CLASS_INDEX: Any = None
+_FAISS_ERROR: str | None = None
+_FAISS_LOCK = threading.Lock()
+
 _READY_PREDICTED = (
     "### 🍽️ Predicted Food\n\n"
     "Upload or capture an image, then press **Analyze Food**."
@@ -43,8 +57,9 @@ _EMPTY_NUTRITION = (
     "### 🧂 Ingredients\n\n—\n\n"
     "### 📖 Description\n\n—"
 )
+_EMPTY_SIMILAR_STATUS = "_Run **Analyze Food** to see visually similar dishes._"
 
-# Label compact 
+# Minimal styling only: keep the Label compact without overriding theme colours.
 CUSTOM_CSS = """
 .compact-label,
 .compact-label .label-container {
@@ -54,14 +69,15 @@ CUSTOM_CSS = """
 .compact-label {
     padding: 0.25rem !important;
 }
+
+.compact-gallery {
+    min-height: 0 !important;
+}
 """
 
 
 def _get_model():
-    """Load the model, transform, and class mapping only once and cache them.
-    Uses a threading lock to ensure that if multiple users click "Analyze"
-    at the same time, the heavy 1.2GB model is only loaded into memory once.
-    """
+    """Load the model once and return ``(model, transform, idx_to_label)``."""
     global _MODEL, _TRANSFORM, _IDX_TO_LABEL, _LOAD_ERROR
 
     if _MODEL is not None:
@@ -76,7 +92,7 @@ def _get_model():
             requested_device = os.getenv("FOOD_CLASSIFIER_DEVICE") or None
             _MODEL, _TRANSFORM, _IDX_TO_LABEL = load_model(device=requested_device)
             _LOAD_ERROR = None
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - show a friendly UI error
             _LOAD_ERROR = str(exc)
             LOGGER.exception("Model loading failed")
             raise RuntimeError(
@@ -87,19 +103,60 @@ def _get_model():
     return _MODEL, _TRANSFORM, _IDX_TO_LABEL
 
 
+def _get_faiss_index() -> Tuple[Any, List[Dict[str, Any]], Any]:
+    """Load the FAISS index, metadata, and class-restricted wrapper once.
+
+    Raises an exception with a user-readable message when the index has not
+    been built yet (``python faiss_search.py``) or FAISS is not installed.
+    """
+    global _FAISS_INDEX, _FAISS_IMAGES, _FAISS_CLASS_INDEX, _FAISS_ERROR
+
+    if _FAISS_CLASS_INDEX is not None:
+        return _FAISS_INDEX, _FAISS_IMAGES, _FAISS_CLASS_INDEX
+
+    if faiss_search is None:
+        raise RuntimeError(
+            "Visual similarity search is unavailable because FAISS could not "
+            f"be imported ({_FAISS_IMPORT_ERROR or 'unknown error'}). "
+            "Install it with `pip install faiss-cpu`."
+        )
+
+    with _FAISS_LOCK:
+        if _FAISS_CLASS_INDEX is not None:
+            return _FAISS_INDEX, _FAISS_IMAGES, _FAISS_CLASS_INDEX
+
+        try:
+            LOGGER.info("Loading FAISS similarity index (first search) ...")
+            index, records = faiss_search.load_index()
+            _FAISS_INDEX = index
+            _FAISS_IMAGES = records
+            # Per-class sub-indexes are built lazily on the first lookup.
+            _FAISS_CLASS_INDEX = faiss_search.ClassIndex(index, records)
+            _FAISS_ERROR = None
+        except Exception as exc:  # noqa: BLE001 - shown in the UI instead
+            _FAISS_ERROR = str(exc)
+            LOGGER.warning("FAISS index unavailable: %s", exc)
+            raise
+
+    return _FAISS_INDEX, _FAISS_IMAGES, _FAISS_CLASS_INDEX
+
+
 def _pretty(name: str) -> str:
-    """Turn fish_and_chips into Fish And Chips."""
+    """Turn ``fish_and_chips`` into ``Fish And Chips``."""
     return name.replace("_", " ").title()
 
 
 def _message_outputs(
     message: str,
-) -> Tuple[Dict[str, float], str, str]:
+    similar_status: str | None = None,
+) -> Tuple[Dict[str, float], str, str, List[Tuple[str, str]], str]:
     """Return an empty prediction plus a readable message in each panel."""
     return (
         {},
         f"### 🍽️ Predicted Food\n\n{message}",
         _EMPTY_NUTRITION,
+        [],
+        similar_status or _EMPTY_SIMILAR_STATUS,
     )
 
 
@@ -131,7 +188,7 @@ def _format_nutrition(info: Dict | None) -> str:
         if calories is None
         else _calorie_badge(calories)
     )
-    # If the food dictionary ever contains HTML tags, this ensures they are rendered as text, not code.
+
     ingredients = info.get("ingredients") or []
     ingredients_text = (
         ", ".join(html.escape(str(item)) for item in ingredients)
@@ -167,10 +224,91 @@ def _format_predicted(predicted: str, confidence: float) -> str:
     )
 
 
+def _find_similar_images(
+    model: Any,
+    image: Image.Image,
+    transform: Any,
+    device: torch.device,
+    output: Any,
+    predicted_label: str,
+    k: int = 3,
+) -> Tuple[List[Tuple[str, str]], str]:
+    """Search the FAISS index among images of the predicted class only.
+
+    Returns ``(gallery_items, status_message)``.  Failures are reported in the
+    status message instead of raising, so a missing index never breaks
+    classification.  When the predicted class has no indexed references the
+    gallery is an empty list.
+    """
+    if faiss_search is None:
+        return [], (
+            "_Visual similarity search is unavailable because FAISS could not "
+            f"be imported._ `{html.escape(_FAISS_IMPORT_ERROR or '')}`"
+        )
+
+    try:
+        _, _, class_index = _get_faiss_index()
+    except Exception as exc:  # noqa: BLE001 - index missing or unreadable
+        return [], (
+            "_Visual similarity index not built yet._ "
+            f"`{html.escape(str(exc))}`"
+        )
+
+    if not class_index.has_class(predicted_label):
+        return [], (
+            f"_No reference images for **{html.escape(_pretty(predicted_label))}** "
+            "in the similarity index._"
+        )
+
+    try:
+        # Reuse the forward pass already computed for classification when it
+        # contains feature tensors; otherwise run a dedicated embedding pass.
+        embedding = faiss_search.embedding_from_output(output)
+        if embedding is None:
+            embedding = faiss_search.extract_embedding(
+                model, image, transform, device
+            )
+        results = class_index.search(
+            embedding, predicted_label, k=k
+        )
+    except Exception as exc:  # noqa: BLE001 - never break the UI
+        LOGGER.exception("FAISS similarity search failed")
+        return [], (
+            "_Visual similarity search failed:_ "
+            f"`{html.escape(type(exc).__name__)}: {html.escape(str(exc))}`"
+        )
+
+    gallery: List[Tuple[str, str]] = []
+    for record in results:
+        path = str(record.get("path") or "")
+        if not path or not os.path.isfile(path):
+            continue
+        label = _pretty(str(record.get("label") or "")) or "Similar dish"
+        similarity = record.get("similarity")
+        if isinstance(similarity, (int, float)):
+            caption = f"{label} · {float(similarity) * 100:.0f}% match"
+        else:
+            caption = label
+        gallery.append((path, caption))
+
+    if not gallery:
+        return [], (
+            f"_No similar images found for "
+            f"**{html.escape(_pretty(predicted_label))}**._"
+        )
+
+    return gallery, (
+        f"_Showing the top {len(gallery)} nearest "
+        f"**{html.escape(_pretty(predicted_label))}** images from the FAISS "
+        "index._"
+    )
+
+
 def predict(
     image: Image.Image | None,
-) -> Tuple[Dict[str, float], str, str]:
-    """Classify an image and return the three UI output values.
+) -> Tuple[Dict[str, float], str, str, List[Tuple[str, str]], str]:
+    """Classify an image and return the UI output values.
+
     Returns
     top3
         Mapping of pretty food names to probabilities for ``gr.Label``.
@@ -178,6 +316,10 @@ def predict(
         Markdown for the prominent predicted-food panel.
     nutrition
         Combined Markdown block with calories, ingredients, and description.
+    similar_gallery
+        ``(image_path, caption)`` pairs for the same-class FAISS matches.
+    similar_status
+        Markdown status line for the similarity panel.
 
     This function is deliberately defensive: every failure mode returns a
     readable message instead of raising and breaking the Gradio event.
@@ -215,12 +357,18 @@ def predict(
 
     try:
         device = getattr(model, "device", torch.device("cpu"))
-        # 1. Preprocessing: Convert image to RGB, resize to 224x224, and normalize.
-        # 2. Unsqueeze(0): The model expects a batch, so we add a dimension (Batch, Channel, Height, Width).
         tensor = transform(rgb_image).unsqueeze(0).to(device)
-        # inference_mode() turns off gradient tracking to save memory and speed up inference.
+
+        # Ask for intermediate features in the same forward pass so the FAISS
+        # search can reuse the embedding instead of running the model twice.
         with torch.inference_mode():
-            output = model(tensor)
+            try:
+                output = model(tensor, return_features=True)
+            except TypeError:  # model without the return_features argument
+                output = model(tensor)
+
+        # The model normally returns a dict, but accept a raw tensor or a
+        # tuple as well so an unexpected API change does not crash the app.
         if isinstance(output, dict):
             logits = output.get("logits")
         elif isinstance(output, (tuple, list)):
@@ -250,9 +398,7 @@ def predict(
                 f"Model returned {logits.shape[1]} classes but the class "
                 f"mapping contains {len(idx_to_label)}."
             )
-        
-        # The model returns logits (raw scores). We apply Softmax to convert 
-        # these into probabilities that sum to 1.0.
+
         probabilities = torch.softmax(logits.float(), dim=1)[0]
         k = min(3, probabilities.numel())
         top_probs, top_indices = torch.topk(probabilities, k=k)
@@ -270,10 +416,21 @@ def predict(
         info = FOOD_INFO.get(predicted)
         top3 = {_pretty(name): float(score) for name, score in top}
 
+        similar_gallery, similar_status = _find_similar_images(
+            model=model,
+            image=rgb_image,
+            transform=transform,
+            device=device,
+            output=output,
+            predicted_label=predicted,
+        )
+
         return (
             top3,
             _format_predicted(predicted, top[0][1]),
             _format_nutrition(info),
+            similar_gallery,
+            similar_status,
         )
 
     except Exception as exc:  # noqa: BLE001 - never break the UI
@@ -285,17 +442,21 @@ def predict(
             "Hugging Face cache and restart the app."
         )
 
-#  Reset the image and all result panels.
+
 def _clear_outputs():
+    """Reset the image and all result panels."""
     return (
         None,
         {},
         _READY_PREDICTED,
         _EMPTY_NUTRITION,
+        [],
+        _EMPTY_SIMILAR_STATUS,
     )
 
-# Create the Gradio Blocks interface.
+
 def build_interface() -> gr.Blocks:
+    """Create the Gradio Blocks interface."""
     with gr.Blocks(
         title="AI Food Analyzer",
         theme=gr.themes.Default(), #theme=gr.themes.Soft() theme=gr.themes.Monochrome() theme=gr.themes.Glass()
@@ -307,47 +468,63 @@ def build_interface() -> gr.Blocks:
             "# AI Food Analyzer\n"
             "Upload a photo to instantly identify the food, estimate calories, and see the ingredients."
         )
-
+        # Main layout 3 columns side by side
         with gr.Row():
-            with gr.Column(scale=1, min_width=300): #This is the column 1 (Image Upload)
+            #c1 image and webcam
+            with gr.Column(scale=1, min_width=300):
                 image_input = gr.Image(
                     type="pil",
                     sources=["upload", "webcam"],
                     label="📷 Upload or capture a food image",
                     height=360,
                 )
+                #analyze and clear buttons
                 with gr.Row():
                     classify_button = gr.Button(
                         "🔍 Analyze Food", variant="primary", scale=2
                     )
                     clear_button = gr.Button(
-                        "Clear", variant="secondary", scale=1
+                        "🗑️ Clear", variant="secondary", scale=1
                     )
 
                 gr.Markdown(
                     "<sub>First prediction downloads the model checkpoint "
                     "(about 1.2 GB) and may take a minute.</sub>"
                 )
-
+                #demo examples
                 gr.Examples(
                     examples=[["pizza.jpg"], ["dumplings.jpg"]],
                     inputs=image_input,
                     label="Try an example:",
                 )
-
-            with gr.Column(scale=1, min_width=300):  #This is the column 2
+            #c2 predictions
+            with gr.Column(scale=1, min_width=300):
                 gr.Markdown("### 🎯 Top-3 Predictions")
+                #gradio label components to show confidence bars
                 top3_output = gr.Label(
                     num_top_classes=3,
                     show_label=False,
                     elem_classes=["compact-label"],
                 )
                 predicted_output = gr.Markdown(_READY_PREDICTED)
-
-            with gr.Column(scale=1, min_width=300): #This is the column 3
+            #c3 nutrition and similar images
+            with gr.Column(scale=1, min_width=300):
                 gr.Markdown("### 🥗 Nutrition")
                 nutrition_output = gr.Markdown(_EMPTY_NUTRITION)
 
+                gr.Markdown("### 🖼️ Visually Similar Dishes")
+                similar_gallery = gr.Gallery(
+                    label="Top-3 same-class FAISS matches",
+                    show_label=False,
+                    columns=3,
+                    rows=1,
+                    height=200,
+                    object_fit="cover",
+                    allow_preview=True,
+                    elem_classes=["compact-gallery"],
+                )
+                similar_status = gr.Markdown(_EMPTY_SIMILAR_STATUS)
+            #event listeners
         classify_button.click(
             fn=predict,
             inputs=image_input,
@@ -355,6 +532,8 @@ def build_interface() -> gr.Blocks:
                 top3_output,
                 predicted_output,
                 nutrition_output,
+                similar_gallery,
+                similar_status,
             ],
         )
         clear_button.click(
@@ -365,9 +544,11 @@ def build_interface() -> gr.Blocks:
                 top3_output,
                 predicted_output,
                 nutrition_output,
+                similar_gallery,
+                similar_status,
             ],
         )
-
+        #footer
         gr.Markdown(
             """
             ---
