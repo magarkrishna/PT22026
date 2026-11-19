@@ -1,14 +1,7 @@
 """Model loading utilities for the hybrid Food-101 classifier.
-
 This module loads a custom PyTorch checkpoint (best_model.pth) and 
 real_class_mapping.json from Hugging Face.
-
-The model is a hybrid ResNet50 + DeiT-Base network with cross-attention fusion.
-This script:
-1. Downloads the weights and class mapping.
-2. Rebuilds the exact hybrid architecture.
-3. Loads the state dict, handling key name differences between transformers 4.x and 5.x.
-4. Returns (model, transform, idx_to_label) for use in the Gradio app and evaluation script.
+handles downloading the checkpoint, mapping DeiT state dict keys, and loading the frozen hybrid classifier.
 """
 
 # Constants for the model on Hugging Face Hub
@@ -32,17 +25,14 @@ LOGGER = logging.getLogger(__name__)
 REPO_ID = os.getenv(
     "FOOD_CLASSIFIER_REPO_ID", "codealchemist01/food-image-classifier-hybrid"
 )
-CHECKPOINT_FILENAME = "best_model.pth"
+CHECKPOINT_FILENAME = "best_model.pth" # trained checkpoint KM
 CLASS_MAPPING_FILENAME = "real_class_mapping.json"
 FALLBACK_CLASS_NAMES_FILENAME = "food101_class_names.json"
 
 IMAGE_SIZE = 224
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
-
-
-# Network definition
-class CNNBranch(nn.Module):
+class CNNBranch(nn.Module): ##Cnn branch KM 
 
     def __init__(
         self,
@@ -98,7 +88,7 @@ class CNNBranch(nn.Module):
         global_features = self.feature_head(global_features)
         return spatial_features, global_features
 
-class ViTBranch(nn.Module):
+class ViTBranch(nn.Module): # Vit Branch KM captures global patch-level attention.
 
     def __init__(
         self,
@@ -180,7 +170,7 @@ class ViTBranch(nn.Module):
         global_features = self.feature_head(global_features)
         return spatial_features, global_features
 
-class AdaptiveFusionModule(nn.Module):
+class AdaptiveFusionModule(nn.Module): #Adaptive KM
     # Cross-attention fusion of CNN and ViT features.
 
     def __init__(
@@ -296,7 +286,7 @@ class AdaptiveFusionModule(nn.Module):
         # 2. ViTBranch -> spatial + global features
         # 3. AdaptiveFusionModule -> fused features
         # 4. Classifier (2-layer MLP) -> 101 class logits
-class HybridFoodClassifier(nn.Module):
+class HybridFoodClassifier(nn.Module): # combines both branch outputs through the fusion module
 
     def __init__(
         self,
@@ -427,7 +417,7 @@ def _strip_module_prefix(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch
     return state_dict
 
 
-def _convert_state_dict_keys(
+def _convert_state_dict_keys(    #model weights might saved on Transformers 4.x, but run on 5.x.;;
     state_dict: Dict[str, torch.Tensor], model_keys
 ) -> Dict[str, torch.Tensor]:
     """Translate DeiT key names between transformers 4.x and 5.x.
@@ -534,8 +524,7 @@ def _download(repo_id: str, filename: str, cache_dir: str | None) -> str:
             "Check your internet connection and Hugging Face access."
         ) from exc
 
-# Public API
-def load_model(
+def load_model( # for consistensy, downloads the checkpoint and moves the model to CUDA or CPU KM ;;
     device: str | torch.device | None = None,
     repo_id: str = REPO_ID,
     cache_dir: str | None = None,
@@ -629,8 +618,7 @@ def load_model(
     model.eval()
     for parameter in model.parameters():
         parameter.requires_grad = False
-    # Define the preprocessing pipeline: resize to 224x224, convert to tensor, and normalize
-    transform = transforms.Compose(
+    transform = transforms.Compose( # preprocessing mismatch ; one shared preprocessing pipeline; reused across
         [
             transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
             transforms.ToTensor(),

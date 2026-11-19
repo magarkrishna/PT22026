@@ -20,7 +20,7 @@ ENV/
 *.h5
 *.faiss
 # Evaluation outputs (generated at runtime)
- eval_outputs/
+eval_outputs/
 
 # Hugging Face / datasets caches (if placed locally)
 .cache/

@@ -152,7 +152,7 @@ def _message_outputs(
 ) -> Tuple[Dict[str, float], str, str, List[Tuple[str, str]], str]:
     """Return an empty prediction plus a readable message in each panel."""
     return (
-        {},
+        {}, #""
         f"### 🍽️ Predicted Food\n\n{message}",
         _EMPTY_NUTRITION,
         [],
@@ -165,6 +165,7 @@ def _calorie_badge(calories: int | float) -> str:
     if calories < 200:
         return f"🟢 Low ({calories} kcal)"
     if calories <= 400:
+        # return f"<span style='color:yellow;'>Moderate</span>"
         return f"🟡 Moderate ({calories} kcal)"
     return f"🔴 High ({calories} kcal)"
 
@@ -199,7 +200,7 @@ def _format_nutrition(info: Dict | None) -> str:
     description = info.get("description") or "No description available."
 
     return (
-        "### 🔥 Calories\n\n"
+        "### 🔥 Calories\n\n" #calories
         f"{calories_text}\n\n"
         "### 🧂 Ingredients\n\n"
         f"{ingredients_text}\n\n"
@@ -415,6 +416,10 @@ def predict(
         predicted = top[0][0]
         info = FOOD_INFO.get(predicted)
         top3 = {_pretty(name): float(score) for name, score in top}
+        """top3 = "\n\n".join(
+                f"**{_pretty(name)}** — {score * 100:.2f}%"
+                for name, score in top
+                )"""
 
         similar_gallery, similar_status = _find_similar_images(
             model=model,
@@ -447,7 +452,7 @@ def _clear_outputs():
     """Reset the image and all result panels."""
     return (
         None,
-        {},
+        {}, #""
         _READY_PREDICTED,
         _EMPTY_NUTRITION,
         [],
@@ -459,7 +464,8 @@ def build_interface() -> gr.Blocks:
     """Create the Gradio Blocks interface."""
     with gr.Blocks(
         title="AI Food Analyzer",
-        theme=gr.themes.Default(), #theme=gr.themes.Soft() theme=gr.themes.Monochrome() theme=gr.themes.Glass()
+        theme=gr.themes.Default(),
+        #theme=gr.themes.Soft() theme=gr.themes.Monochrome() theme=gr.themes.Glass()
         # theme=gr.themes.Default(primary_hue="indigo", secondary_hue="slate")
         #theme=gr.themes.Default(font=["Arial", "sans-serif"]),
         css=CUSTOM_CSS,
@@ -467,6 +473,7 @@ def build_interface() -> gr.Blocks:
         gr.Markdown(
             "# AI Food Analyzer\n"
             "Upload a photo to instantly identify the food, estimate calories, and see the ingredients."
+            #"<p style='color: blue;'>Upload a photo to instantly identify the food...</p>"
         )
         # Main layout 3 columns side by side
         with gr.Row():
@@ -476,7 +483,7 @@ def build_interface() -> gr.Blocks:
                     type="pil",
                     sources=["upload", "webcam"],
                     label="📷 Upload or capture a food image",
-                    height=360,
+                    height=300,
                 )
                 #analyze and clear buttons
                 with gr.Row():
@@ -505,7 +512,8 @@ def build_interface() -> gr.Blocks:
                     num_top_classes=3,
                     show_label=False,
                     elem_classes=["compact-label"],
-                )
+                ) 
+                # top3_output = gr.Markdown()
                 predicted_output = gr.Markdown(_READY_PREDICTED)
             #c3 nutrition and similar images
             with gr.Column(scale=1, min_width=300):
